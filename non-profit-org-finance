@@ -1,0 +1,414 @@
+import sqlite3, os, sys, datetime, itertools
+DB_FILE = "nonprofit_finance.db"
+
+VOUCHER_TYPES = ["CASH_PAYMENT","CASH_RECEIPT","BANK_PAYMENT","BANK_RECEIPT","JOURNAL"]
+ACCOUNT_TYPES = ["ASSET","LIABILITY","FUND_BALANCE","INCOME","EXPENSE"]
+
+def conn():
+    return sqlite3.connect(DB_FILE)
+
+def init_db():
+    with conn() as c:
+        c.executescript("""
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS activities(
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS accounts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('ASSET','LIABILITY','FUND_BALANCE','INCOME','EXPENSE'))
+        );
+        CREATE TABLE IF NOT EXISTS vouchers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('CASH_PAYMENT','CASH_RECEIPT','BANK_PAYMENT','BANK_RECEIPT','JOURNAL')),
+            activity_code TEXT,
+            activity_name TEXT,
+            description TEXT,
+            FOREIGN KEY(activity_code) REFERENCES activities(code)
+        );
+        CREATE TABLE IF NOT EXISTS voucher_lines(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            voucher_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            debit REAL NOT NULL DEFAULT 0,
+            credit REAL NOT NULL DEFAULT 0,
+            book TEXT CHECK(book IN ('CASH','BANK','GENERAL')),
+            FOREIGN KEY(voucher_id) REFERENCES vouchers(id) ON DELETE CASCADE,
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        );
+        CREATE VIEW IF NOT EXISTS cash_book AS
+        SELECT v.id as voucher_id,v.date,vl.account_id,vl.debit,vl.credit,v.activity_name,v.description
+        FROM vouchers v JOIN voucher_lines vl ON v.id=vl.voucher_id
+        WHERE vl.book='CASH';
+        CREATE VIEW IF NOT EXISTS bank_book AS
+        SELECT v.id as voucher_id,v.date,vl.account_id,vl.debit,vl.credit,v.activity_name,v.description
+        FROM vouchers v JOIN voucher_lines vl ON v.id=vl.voucher_id
+        WHERE vl.book='BANK';
+        """)
+    seed_minimum()
+
+def seed_minimum():
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO accounts(name,type) VALUES(?,?)",("Cash", "ASSET"))
+        c.execute("INSERT OR IGNORE INTO accounts(name,type) VALUES(?,?)",("Bank", "ASSET"))
+        c.execute("INSERT OR IGNORE INTO activities(code,name) VALUES(?,?)",("OFFICE","Office Operations"))
+
+def ensure_db():
+    if not os.path.exists(DB_FILE):
+        init_db()
+
+def input_date(prompt="Date (YYYY-MM-DD, blank=today): "):
+    s=input(prompt).strip()
+    if not s:
+        return datetime.date.today().isoformat()
+    return s
+
+def select_activity():
+    with conn() as c:
+        rows=c.execute("SELECT code,name FROM activities ORDER BY code").fetchall()
+    if not rows:
+        return None
+    for i,(code,name) in enumerate(rows,1):
+        print(f"{i}. {code} - {name}")
+    s=input("Select Activity (blank=None): ").strip()
+    if not s:
+        return None
+    try:
+        idx=int(s)-1
+        if idx < 0 or idx >= len(rows):
+            print("Invalid selection.")
+            return select_activity() # Ask again
+        return rows[idx][0]
+    except ValueError:
+        print("Invalid input. Please enter a number.")
+        return select_activity() # Ask again
+
+def get_account_by_name(name):
+    with conn() as c:
+        row=c.execute("SELECT id,name,type FROM accounts WHERE name=?",(name,)).fetchone()
+    return row
+
+def list_accounts():
+    with conn() as c:
+        rows=c.execute("SELECT id,name,type FROM accounts ORDER BY name").fetchall()
+    for r in rows:
+        print(f"{r[0]} | {r[1]} | {r[2]}")
+    return rows
+
+def pick_account():
+    rows=list_accounts()
+    s=input("Account id or new name: ").strip()
+    if s.isdigit():
+        return int(s)
+    else:
+        t=pick_account_type()
+        with conn() as c:
+            c.execute("INSERT OR IGNORE INTO accounts(name,type) VALUES(?,?)",(s,t))
+            row=c.execute("SELECT id FROM accounts WHERE name=?",(s,)).fetchone()
+            return row[0]
+
+def pick_account_type():
+    for i,t in enumerate(ACCOUNT_TYPES,1):
+        print(f"{i}. {t}")
+    while True:
+        try:
+            idx=int(input("Account type: ").strip())-1
+            if idx < 0 or idx >= len(ACCOUNT_TYPES):
+                print("Invalid selection.")
+            else:
+                return ACCOUNT_TYPES[idx]
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+def add_activity():
+    code=input("Activity code: ").strip().upper()
+    name=input("Activity name: ").strip()
+    with conn() as c:
+        c.execute("INSERT OR REPLACE INTO activities(code,name) VALUES(?,?)",(code,name))
+    print("OK")
+
+def ensure_balanced(lines):
+    d=sum(x["debit"] for x in lines)
+    c=sum(x["credit"] for x in lines)
+    return abs(d-c)<0.0001
+
+def enter_lines(vtype):
+    lines=[]
+    print("Enter lines; blank account to finish.")
+    while True:
+        a=input("Account (blank=finish, list=?): ").strip()
+        if a=="?":
+            list_accounts(); continue
+        if not a:
+            break
+        acc=get_account_by_name(a)
+        if not acc:
+            print("New account")
+            acc_id=pick_account()
+        else:
+            acc_id=acc[0]
+        debit=float(input("Debit: ").strip() or "0")
+        credit=float(input("Credit: ").strip() or "0")
+        book="GENERAL"
+        if vtype in ("CASH_PAYMENT","CASH_RECEIPT"):
+            book="CASH"
+        if vtype in ("BANK_PAYMENT","BANK_RECEIPT"):
+            book="BANK"
+        lines.append({"account_id":acc_id,"debit":debit,"credit":credit,"book":"GENERAL"})
+    if vtype=="CASH_PAYMENT":
+        cash=get_account_by_name("Cash")[0]
+        amt=sum(l["credit"]-l["debit"] for l in lines)
+        lines.append({"account_id":cash,"debit":0,"credit":max(0,amt),"book":"CASH"})
+    elif vtype=="CASH_RECEIPT":
+        cash=get_account_by_name("Cash")[0]
+        amt=sum(l["debit"]-l["credit"] for l in lines)
+        lines.append({"account_id":cash,"debit":max(0,amt),"credit":0,"book":"CASH"})
+    elif vtype=="BANK_PAYMENT":
+        bank=get_account_by_name("Bank")[0]
+        amt=sum(l["credit"]-l["debit"] for l in lines)
+        lines.append({"account_id":bank,"debit":0,"credit":max(0,amt),"book":"BANK"})
+    elif vtype=="BANK_RECEIPT":
+        bank=get_account_by_name("Bank")[0]
+        amt=sum(l["debit"]-l["credit"] for l in lines)
+        lines.append({"account_id":bank,"debit":max(0,amt),"credit":0,"book":"BANK"})
+    if not ensure_balanced(lines):
+        print("Not balanced; restart.")
+        return enter_lines(vtype)
+    return lines
+
+def create_voucher(vtype):
+    d=input_date()
+    act=select_activity()
+    desc=input("Description: ").strip()
+    lines=enter_lines(vtype)
+    with conn() as c:
+        c.execute("INSERT INTO vouchers(date,type,activity_code,description) VALUES(?,?,?,?)",(d,vtype,act,desc))
+        vid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for l in lines:
+            c.execute("INSERT INTO voucher_lines(voucher_id,account_id,debit,credit,book) VALUES(?,?,?,?,?)",(vid,l["account_id"],l["debit"],l["credit"],l["book"]))
+    print(f"Saved voucher {vid}")
+
+def report_total_expense(start_date=None,end_date=None):
+    q="""
+    SELECT a.name AS account, IFNULL(SUM(vl.debit-vl.credit),0) AS amount
+    FROM voucher_lines vl
+    JOIN accounts a ON a.id=vl.account_id
+    JOIN vouchers v ON v.id=vl.voucher_id
+    WHERE a.type='EXPENSE' AND v.date BETWEEN ? AND ?
+    GROUP BY a.name
+    ORDER BY amount DESC
+    """
+    if not start_date: start_date="0001-01-01"
+    if not end_date: end_date="9999-12-31"
+    with conn() as c:
+        rows=c.execute(q,(start_date,end_date)).fetchall()
+    print("Total Expense Summary")
+    for r in rows:
+        print(f"{r[0]:30s} {r[1]:.2f}")
+    print(f"{'TOTAL':30s} {sum(x[1] for x in rows):.2f}")
+
+def report_office_operational_monthly(activity_code=None, year=None, month=None):
+    if not year:
+        year=datetime.date.today().year
+    if not month:
+        month=datetime.date.today().month
+    if not activity_code:
+        activity_code="OFFICE"
+    start=datetime.date(year,month,1).isoformat()
+    if month==12:
+        end=datetime.date(year+1,1,1)-datetime.timedelta(days=1)
+    else:
+        end=datetime.date(year,month+1,1)-datetime.timedelta(days=1)
+    end=end.isoformat()
+    q="""
+    SELECT a.name, IFNULL(SUM(vl.debit-vl.credit),0) as amount
+    FROM vouchers v
+    JOIN voucher_lines vl ON vl.voucher_id=v.id
+    JOIN accounts a ON a.id=vl.account_id
+    WHERE v.activity_code=? AND a.type='EXPENSE' AND v.date BETWEEN ? AND ?
+    GROUP BY a.name
+    ORDER BY amount DESC
+    """
+    with conn() as c:
+        rows=c.execute(q,(activity_code,start,end)).fetchall()
+    print(f"Office Operational Expenses {activity_code} {year}-{month:02d}")
+    for r in rows:
+        print(f"{r[0]:30s} {r[1]:.2f}")
+    print(f"{'TOTAL':30s} {sum(x[1] for x in rows):.2f}")
+
+def ledger_account(activity_code=None, account_name=None, start=None, end=None):
+    if not account_name:
+        account_name=input("Account name: ").strip()
+    with conn() as c:
+        acc=c.execute("SELECT id,name FROM accounts WHERE name=?",(account_name,)).fetchone()
+        if not acc:
+            print("No such account")
+            return
+        params=[]
+        q="""
+        SELECT v.date,v.id, v.activity_code, vl.debit, vl.credit, v.description
+        FROM voucher_lines vl
+        JOIN vouchers v ON v.id=vl.voucher_id
+        WHERE vl.account_id=?
+        """
+        params.append(acc[0])
+        if activity_code:
+            q+=" AND v.activity_code=?"; params.append(activity_code)
+        if start:
+            q+=" AND v.date>=?"; params.append(start)
+        if end:
+            q+=" AND v.date<=?"; params.append(end)
+        q+=" ORDER BY v.date,v.id,vl.id"
+        rows=c.execute(q,tuple(params)).fetchall()
+    bal=0.0
+    print(f"Ledger: {acc[1]} Activity: {activity_code or 'ALL'}")
+    print("Date        VchId  Act   Debit       Credit      Balance")
+    for d,vid,act,de,cr,desc in rows:
+        bal+=de-cr
+        print(f"{d}  {vid:<5} {str(act or ''):<5} {de:10.2f} {cr:10.2f} {bal:10.2f}  {desc or ''}")
+
+def balance_sheet(as_of=None):
+    if not as_of:
+        as_of=datetime.date.today().isoformat()
+    q="""
+    SELECT a.type, IFNULL(SUM(vl.debit-vl.credit),0) AS balance
+    FROM voucher_lines vl
+    JOIN vouchers v ON v.id=vl.voucher_id
+    JOIN accounts a ON a.id=vl.account_id
+    WHERE v.date<=?
+    GROUP BY a.type
+    """
+    with conn() as c:
+        rows=c.execute(q,(as_of,)).fetchall()
+        bytype=dict(rows)
+        ac_rows=c.execute("""
+        SELECT a.name, IFNULL(SUM(vl.debit-vl.credit),0) AS bal
+        FROM voucher_lines vl
+        JOIN vouchers v ON v.id=vl.voucher_id
+        JOIN accounts a ON a.id=vl.account_id
+        WHERE v.date<=? AND a.type IN ('ASSET','LIABILITY','FUND_BALANCE')
+        GROUP BY a.name
+        ORDER BY a.type,a.name
+        """,(as_of,)).fetchall()
+    assets=sum(b for t,b in rows if t=="ASSET")
+    liabilities=sum(b for t,b in rows if t=="LIABILITY")
+    funds=sum(b for t,b in rows if t=="FUND_BALANCE")
+    income=sum(b for t,b in rows if t=="INCOME")
+    expense=sum(b for t,b in rows if t=="EXPENSE")
+    surplus=income-expense
+    net_funds=funds+surplus
+    print(f"Balance Sheet as of {as_of}")
+    print("Assets")
+    for n,b in ac_rows:
+        with conn() as c:
+            t=c.execute("SELECT type FROM accounts WHERE name=?",(n,)).fetchone()[0]
+        if t=="ASSET" and abs(b)>0.0001:
+            print(f"  {n:30s} {b:12.2f}")
+    print(f"  {'Total Assets':30s} {assets:12.2f}")
+    print("Liabilities")
+    for n,b in ac_rows:
+        with conn() as c:
+            t=c.execute("SELECT type FROM accounts WHERE name=?",(n,)).fetchone()[0]
+        if t=="LIABILITY" and abs(b)>0.0001:
+            print(f"  {n:30s} {b:12.2f}")
+    print(f"  {'Total Liabilities':30s} {liabilities:12.2f}")
+    print("Net Assets/Fund Balance")
+    print(f"  {'Opening Fund Balance':30s} {funds:12.2f}")
+    print(f"  {'Surplus/(Deficit) YTD':30s} {surplus:12.2f}")
+    print(f"  {'Net Fund Balance':30s} {net_funds:12.2f}")
+    print(f"{'Assets = Liabilities + Net Funds':30s} {(liabilities+net_funds):12.2f}")
+
+def list_vouchers():
+    with conn() as c:
+        rows=c.execute("SELECT id,date,type,activity_code,description FROM vouchers ORDER BY date,id").fetchall()
+    for r in rows:
+        print(f"{r[0]} | {r[1]} | {r[2]} | {r[3] or ''} | {r[4] or ''}")
+
+def cash_book_report(start=None,end=None):
+    if not start: start="0001-01-01"
+    if not end: end="9999-12-31"
+    with conn() as c:
+        rows=c.execute("SELECT date,voucher_id,account_id,debit,credit,description FROM cash_book WHERE date BETWEEN ? AND ? ORDER BY date,voucher_id",(start,end)).fetchall()
+        names={r[0]:r[1] for r in c.execute("SELECT id,name FROM accounts")}
+    bal=0.0
+    print("Cash Book")
+    for d,vid,acc,de,cr,desc in rows:
+        bal+=de-cr
+        print(f"{d}  {vid:<5} {names.get(acc,''):<20} {de:10.2f} {cr:10.2f} {bal:10.2f}  {desc or ''}")
+
+def bank_book_report(start=None,end=None):
+    if not start: start="0001-01-01"
+    if not end: end="9999-12-31"
+    with conn() as c:
+        rows=c.execute("SELECT date,voucher_id,account_id,debit,credit,description FROM bank_book WHERE date BETWEEN ? AND ? ORDER BY date,voucher_id",(start,end)).fetchall()
+        names={r[0]:r[1] for r in c.execute("SELECT id,name FROM accounts")}
+    bal=0.0
+    print("Bank Book")
+    for d,vid,acc,de,cr,desc in rows:
+        bal+=de-cr
+        print(f"{d}  {vid:<5} {names.get(acc,''):<20} {de:10.2f} {cr:10.2f} {bal:10.2f}  {desc or ''}")
+
+def menu():
+    ensure_db()
+    while True:
+        print("")
+        print("1 Init DB")
+        print("2 Add Activity")
+        print("3 List Accounts")
+        print("4 Cash Payment Voucher")
+        print("5 Cash Receipt Voucher")
+        print("6 Bank Payment Voucher")
+        print("7 Bank Receipt Voucher")
+        print("8 Journal Voucher")
+        print("9 Cash Book")
+        print("10 Bank Book")
+        print("11 Total Expense Summary")
+        print("12 Monthly Office Operational")
+        print("13 Ledger")
+        print("14 Balance Sheet")
+        print("15 List Vouchers")
+        print("0 Exit")
+        ch=input("Choose: ").strip()
+        if ch=="1": init_db()
+        elif ch=="2": add_activity()
+        elif ch=="3": list_accounts()
+        elif ch=="4": create_voucher("CASH_PAYMENT")
+        elif ch=="5": create_voucher("CASH_RECEIPT")
+        elif ch=="6": create_voucher("BANK_PAYMENT")
+        elif ch=="7": create_voucher("BANK_RECEIPT")
+        elif ch=="8": create_voucher("JOURNAL")
+        elif ch=="9":
+            s=input("Start (YYYY-MM-DD): ").strip() or None
+            e=input("End (YYYY-MM-DD): ").strip() or None
+            cash_book_report(s,e)
+        elif ch=="10":
+            s=input("Start (YYYY-MM-DD): ").strip() or None
+            e=input("End (YYYY-MM-DD): ").strip() or None
+            bank_book_report(s,e)
+        elif ch=="11":
+            s=input("Start (YYYY-MM-DD): ").strip() or None
+            e=input("End (YYYY-MM-DD): ").strip() or None
+            report_total_expense(s,e)
+        elif ch=="12":
+            act=input("Activity code (blank=OFFICE): ").strip().upper() or "OFFICE"
+            y=int(input("Year: ").strip() or datetime.date.today().year)
+            m=int(input("Month (1-12): ").strip() or datetime.date.today().month)
+            report_office_operational_monthly(act,y,m)
+        elif ch=="13":
+            act=input("Activity code (blank=ALL): ").strip().upper() or None
+            acc=input("Account name: ").strip() or None
+            s=input("Start (YYYY-MM-DD): ").strip() or None
+            e=input("End (YYYY-MM-DD): ").strip() or None
+            ledger_account(act,acc,s,e)
+        elif ch=="14":
+            as_of=input("As of (YYYY-MM-DD, blank=today): ").strip() or None
+            balance_sheet(as_of)
+        elif ch=="15": list_vouchers()
+        elif ch=="0": break
+        else: print("Invalid choice")
+
+menu()
+
